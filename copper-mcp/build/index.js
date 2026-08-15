@@ -302,8 +302,84 @@ async function main() {
     if (transport === "http") {
         // Remote hosting mode (for a claude.ai custom connector behind your own HTTPS).
         const express = (await import("express")).default;
+        const { createHash, randomUUID } = await import("crypto");
         const app = express();
+        app.set("trust proxy", true);
         app.use(express.json());
+        app.use(express.urlencoded({ extended: false }));
+        // ---- OAuth 2.0 (required by claude.ai custom connector) ----
+        // In-memory store — sufficient for a single-tenant personal server.
+        const oauthClients = new Map();
+        const oauthCodes = new Map();
+        const oauthTokens = new Set();
+        const baseUrl = (req) => `https://${req.hostname}`;
+        // RFC 9728 – Protected Resource Metadata
+        app.get("/.well-known/oauth-protected-resource", (req, res) => {
+            const b = baseUrl(req);
+            res.json({ resource: b, authorization_servers: [b] });
+        });
+        // RFC 8414 – Authorization Server Metadata
+        app.get("/.well-known/oauth-authorization-server", (req, res) => {
+            const b = baseUrl(req);
+            res.json({
+                issuer: b,
+                authorization_endpoint: `${b}/oauth/authorize`,
+                token_endpoint: `${b}/oauth/token`,
+                registration_endpoint: `${b}/oauth/register`,
+                response_types_supported: ["code"],
+                grant_types_supported: ["authorization_code", "refresh_token"],
+                code_challenge_methods_supported: ["S256"],
+                token_endpoint_auth_methods_supported: ["none"],
+            });
+        });
+        // RFC 7591 – Dynamic Client Registration
+        app.post("/oauth/register", (req, res) => {
+            const clientId = randomUUID().replace(/-/g, "");
+            oauthClients.set(clientId, req.body);
+            res.status(201).json({
+                client_id: clientId,
+                redirect_uris: req.body.redirect_uris || [],
+                client_name: req.body.client_name || "MCP Client",
+                grant_types: ["authorization_code"],
+                response_types: ["code"],
+                token_endpoint_auth_method: "none",
+            });
+        });
+        // Authorization Endpoint – auto-approve (single-tenant personal server)
+        app.get("/oauth/authorize", (req, res) => {
+            const { redirect_uri, state, code_challenge, code_challenge_method } = req.query;
+            const code = randomUUID().replace(/-/g, "");
+            oauthCodes.set(code, { redirect_uri, code_challenge, code_challenge_method });
+            const redir = new URL(redirect_uri);
+            redir.searchParams.set("code", code);
+            if (state) redir.searchParams.set("state", state);
+            res.redirect(redir.toString());
+        });
+        // Token Endpoint
+        app.post("/oauth/token", (req, res) => {
+            const { grant_type, code, code_verifier } = req.body;
+            if (grant_type === "authorization_code") {
+                const codeData = oauthCodes.get(code);
+                if (!codeData) return res.status(400).json({ error: "invalid_grant" });
+                oauthCodes.delete(code);
+                if (codeData.code_challenge && codeData.code_challenge_method === "S256") {
+                    const expected = createHash("sha256").update(code_verifier || "").digest("base64url");
+                    if (expected !== codeData.code_challenge) {
+                        return res.status(400).json({ error: "invalid_grant", error_description: "PKCE mismatch" });
+                    }
+                }
+                const token = randomUUID().replace(/-/g, "");
+                oauthTokens.add(token);
+                return res.json({ access_token: token, token_type: "bearer", expires_in: 2592000 });
+            }
+            if (grant_type === "refresh_token") {
+                const token = randomUUID().replace(/-/g, "");
+                oauthTokens.add(token);
+                return res.json({ access_token: token, token_type: "bearer", expires_in: 2592000 });
+            }
+            res.status(400).json({ error: "unsupported_grant_type" });
+        });
+        // ---- MCP endpoint ----
         const httpTransport = new StreamableHTTPServerTransport({
             sessionIdGenerator: undefined, // stateless JSON mode
         });
